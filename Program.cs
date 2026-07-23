@@ -33,16 +33,15 @@ class Program
     var port      = config["PostgreSQL:Port"] ?? "5432";
     var bucket    = config["S3:BucketName"]   ?? "keithlong-art-photos";
 
-    Console.WriteLine("╔════════════════════════════════════════════════════════════╗");
-    Console.WriteLine("║       Keith Long Archive - Check Photo TIFs in S3         ║");
-    Console.WriteLine("╚════════════════════════════════════════════════════════════╝");
+    PrintTitleBox("Keith Long Archive - Check Photo TIFs in S3");
     Console.WriteLine();
 
     Console.WriteLine("Retrieving DB credentials from Secrets Manager...");
     var (user, pass) = await GetCreds(secretArn);
-    // Timeout is generous because the Aurora cluster can be paused and take
-    // ~30-60s to resume on the first connection ("waking the DB").
-    var connStr = $"Host={host};Port={port};Database={database};Username={user};Password={pass};SSL Mode=Require;Trust Server Certificate=true;Timeout=120;Command Timeout=180";
+    // Per-attempt Timeout is short so a dropped SYN (paused Aurora) fails fast and
+    // we retry with feedback, rather than letting the OS abort the socket at ~21s.
+    // OpenWithRetryAsync keeps re-attempting while the cluster resumes ("waking the DB").
+    var connStr = $"Host={host};Port={port};Database={database};Username={user};Password={pass};SSL Mode=Require;Trust Server Certificate=true;Timeout=30;Command Timeout=180";
     Console.WriteLine("✓ Credentials retrieved\n");
 
     Console.WriteLine("Querying photo table...");
@@ -119,7 +118,7 @@ class Program
 
     var list = new List<PhotoRow>();
     await using var conn = new NpgsqlConnection(connStr);
-    await conn.OpenAsync();
+    await OpenWithRetryAsync(conn);
     await using var cmd = new NpgsqlCommand(sql, conn);
     await using var r = await cmd.ExecuteReaderAsync();
     while (await r.ReadAsync())
@@ -129,6 +128,37 @@ class Program
         r.IsDBNull(2) ? null : r.GetString(2),
         r.IsDBNull(3) ? null : r.GetString(3)));
     return list;
+  }
+
+  // A paused Aurora Serverless cluster can take ~30-60s to resume, during which
+  // connection attempts time out (SYN dropped). Keep retrying so the tool waits
+  // for the DB to wake instead of failing on the first attempt.
+  static async Task OpenWithRetryAsync(NpgsqlConnection conn, int maxAttempts = 8, int delaySeconds = 15)
+  {
+    for (int attempt = 1; ; attempt++)
+    {
+      try
+      {
+        await conn.OpenAsync();
+        if (attempt > 1) Console.WriteLine("  ✓ database is awake");
+        return;
+      }
+      catch (Exception ex) when (ex is NpgsqlException or TimeoutException && attempt < maxAttempts)
+      {
+        Console.WriteLine($"  DB not responding yet (attempt {attempt}/{maxAttempts}) — waking it up, retrying in {delaySeconds}s...");
+        await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
+      }
+    }
+  }
+
+  static void PrintTitleBox(string title)
+  {
+    const int width = 60; // interior width, matches the top/bottom rule
+    int pad = Math.Max(0, width - title.Length);
+    int left = pad / 2, right = pad - left;
+    Console.WriteLine("╔" + new string('═', width) + "╗");
+    Console.WriteLine("║" + new string(' ', left) + title + new string(' ', right) + "║");
+    Console.WriteLine("╚" + new string('═', width) + "╝");
   }
 
   static async Task<HashSet<string>> ListAllKeys(string bucket)
